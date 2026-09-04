@@ -254,7 +254,11 @@ and always validate in MuJoCo first. Passing the sim2sim check is not
 authorization to run on hardware.
 
 ---
+## Acknowledgements
 
+https://github.com/uwvwko-zzz/uw-backflip Thanks to the awesome person for open-sourcing the gym project, which I migrated to the lab.
+
+---
 ## License
 
 [MIT](LICENSE)
