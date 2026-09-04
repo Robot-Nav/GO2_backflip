@@ -13,6 +13,12 @@
 
 TS-backflip is a teacher-student reinforcement learning framework for training acrobatic skills on the Unitree GO2 quadruped inside Isaac Lab. The method decomposes each skill into a sequence of stages, trains a teacher policy with constrained multi-objective PPO (CoMoPPO) under full state access, and then distills a student policy that runs from partial observations.
 
+---
+
+[👉 README_CN ](https://github.com/Robot-Nav/GO2_backflip/blob/TS-backflip/README_cn.md)
+
+---
+
 ## Overview
 
 Training a backflip from scratch with a single dense reward is hard: the robot has to learn when to crouch, when to jump, how to rotate, and how to land, all at once. TS-backflip addresses this by shaping the reward per stage. The skill is split into ordered phases (for example `stand -> sit -> jump -> air -> land`), and each phase activates a different subset of reward terms. A one-hot stage signal tracks the current phase and is fed to both the actor and the critics.
