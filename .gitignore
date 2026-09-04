@@ -1,0 +1,18 @@
+*.ipynb
+*.pkl
+*.pt
+*.pyc
+*.png
+*.sh
+.env
+args.txt
+
+__pycache__
+wandb
+model
+results
+.vscode
+
+# 第三方机器人描述与 SDK（体积过大，且核心环境使用 isaaclab_assets 中的 GO2 模型）
+unitree_ros/
+unitree_sdk2/
