@@ -239,6 +239,11 @@ python mujoco/go2/play_onnx.py \
 运行。
 
 ---
+## 致谢
+
+https://github.com/uwvwko-zzz/uw-backflip感谢大佬的gym开源，对其进行lab迁移
+
+---
 
 ## 许可证
 
