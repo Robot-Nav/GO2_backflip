@@ -13,6 +13,10 @@ asymmetric Proximal Policy Optimization (PPO) and deployed to the real robot.
 
 ---
 
+
+中文：[👉 README_CN ](https://github.com/Robot-Nav/GO2_backflip/blob/PPO-backflip/README_CN.md)
+
+---
 ## Overview
 
 This repository trains a 12-DoF Unitree Go2 to perform a single backflip and
@@ -35,7 +39,7 @@ that the final policy respects hardware limits.
 | `deploy_real/` | Real-robot deployment layer (500 Hz low-level control and safety) |
 | `resources/` | Unitree Go2 / dog URDF, meshes, and MuJoCo assets |
 
-Real-robot demo: [assets/go2_backflip_real.mp4](assets/go2_backflip_real.mp4)
+Real-robot demo:
 
 ---
 
