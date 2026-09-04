@@ -32,7 +32,7 @@ critic 额外接收仿真器独有的随机化真值（165 维）。**安全课�
 | `deploy_real/` | 真机部署层（500 Hz 底层控制与安全保护） |
 | `resources/` | 宇树 Go2 / dog 的 URDF、网格与 MuJoCo 资产 |
 
-真机演示视频：[assets/go2_backflip_real.mp4](assets/go2_backflip_real.mp4)
+真机演示视频：
 
 ---
 
