@@ -49,6 +49,7 @@ target = action_scale * action + default_dof_pos + motor_offset
 tau    = kp * (target - dof_pos) - kd * dof_vel
 ```
 
+发送给 PD 控制器的目标会裁剪到 URDF 关节范围的 95%，动作本身裁剪到 `[-8, 8]`。
 其中 `kp = 40.0 N·m/rad`、`kd = 1.0 N·m·s/rad`。指令力矩由 Go2HV 扭矩-速度包络
 饱和（低于 13.5 rad/s 时驱动/制动峰值分别为 20.2 / 23.4 N·m，到 30 rad/s 线性
 降为零）。
@@ -136,10 +137,10 @@ L = L_CLIP + value_loss_coef * L_V - entropy_coef * H[pi]
 | 接触偏移 | `[0.0075, 0.0125]` |
 | 静止偏移 | `[-0.001, 0.001]` |
 | 机身质量 | 附加 `[-0.5, 1.0]` kg |
-| 机身质心 | `[-0.01, 0.01]` m |
+| 机身质心 | `[-0.015, 0.015]` m |
 | 肢体质量缩放 | `[0.95, 1.05]` |
 | 肢体惯量抖动 | `[0.90, 1.10]` |
-| 扭矩缩放 | `[0.80, 1.00]` |
+| 扭矩缩放 | `[0.75, 1.00]` |
 | 电机速度缩放 | `[0.85, 1.00]` |
 | PD 增益缩放 | `[0.8, 1.2]` |
 | 电机零位 | `[-0.02, 0.02]` |
@@ -152,9 +153,10 @@ L = L_CLIP + value_loss_coef * L_V - entropy_coef * H[pi]
 scale = start + (1 - start) * clamp((step - warmup) / ramp, 0, 1)
 ```
 
-发现阶段先以较弱的安全压力开始（`start = 0.05`），让 PPO 先找到后空翻动作，再在
-数千次更新内平滑加强到全强度。关节速度终止比从 `3.0`（约 90 rad/s）收紧到
-`1.05`（约 31.5 rad/s），使最终策略保持在硬件包络内。
+前 1000 次 PPO 更新保持原始目标（`start = 0`），随后用 3000 次更新把安全约束平滑
+加强到全强度，最后 1000 次更新在完整安全包络下训练。关节速度终止比从 `1.5`
+收紧到 `1.0`，关节位置允许的硬限位余量从 `0.30 rad` 收紧到零；达到完整课程后，
+非足端身体接触也会直接终止回合。
 
 ---
 
@@ -183,33 +185,26 @@ cd PPO-backflip
 
 # 冒烟测试：16 个环境，执行 1 次 PPO 更新
 python train.py --headless --device cuda:0 --num_envs 16 \
-  --trainer rsl_rl --profile safety_initial_repro \
+  --trainer rsl_rl \
   --max_iterations 1 --run_name smoke
 
-# 从零完整复现 safety-initial 策略
+# 从零训练微调后的 Gym 等价任务
 python train.py --headless --device cuda:0 --num_envs 4096 \
   --seed 1 --trainer rsl_rl \
-  --profile safety_initial_repro --max_iterations 5000 \
-  --run_name safety_initial_repro
+  --max_iterations 5000 --run_name gym_finetuned
 ```
 
 checkpoint 与 TensorBoard 日志写入
 `logs/rsl_rl/go2_backflip/<时间戳>_<run_name>/`。
 
-可用 profile：`gym_discovery`、`lab_discovery`、`safety_initial_repro`（默认）、
-`safety_targets`、`safety_landing`、`hardware_targets`、`hardware_velocity`。
-其中 `hardware_*` profile 需要配合 `--resume --checkpoint` 使用。
-
 ### 回放与导出
 
 ```bash
 python play.py --device cuda:0 --num_envs 1 \
-  --profile safety_initial_repro \
   --checkpoint logs/rsl_rl/go2_backflip/<run>/model_<N>.pt
 
 # 无窗口回放并导出 ONNX
 python play.py --headless --device cuda:0 --num_envs 1 --steps 1 --export \
-  --profile safety_initial_repro \
   --checkpoint logs/rsl_rl/go2_backflip/<run>/model_<N>.pt
 ```
 

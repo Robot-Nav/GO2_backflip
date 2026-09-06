@@ -3,6 +3,8 @@
 Phase-conditioned backflip control for the Unitree Go2 quadruped, trained with
 asymmetric Proximal Policy Optimization (PPO) and deployed to the real robot.
 
+中文：[👉 README_CN](https://github.com/Robot-Nav/GO2_backflip/blob/PPO-backflip/README_CN.md)
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)]()
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white)]()
@@ -56,7 +58,9 @@ target = action_scale * action + default_dof_pos + motor_offset
 tau    = kp * (target - dof_pos) - kd * dof_vel
 ```
 
-with `kp = 40.0 N·m/rad` and `kd = 1.0 N·m·s/rad`. The commanded torque is
+The PD target is clamped to 95% of the URDF joint range and the action itself
+is clipped to `[-8, 8]`. With `kp = 40.0 N·m/rad` and
+`kd = 1.0 N·m·s/rad`, the commanded torque is
 saturated by the Go2HV torque-speed envelope (20.2 N·m driving / 23.4 N·m braking
 below 13.5 rad/s, linearly derated to zero at 30 rad/s).
 
@@ -148,10 +152,10 @@ penalties for head contact, joint-limit excess, and joint overspeed.
 | Contact offset | `[0.0075, 0.0125]` |
 | Rest offset | `[-0.001, 0.001]` |
 | Base mass | `[-0.5, 1.0]` kg added |
-| Base CoM | `[-0.01, 0.01]` m |
+| Base CoM | `[-0.015, 0.015]` m |
 | Limb mass scale | `[0.95, 1.05]` |
 | Limb inertia jitter | `[0.90, 1.10]` |
-| Torque scale | `[0.80, 1.00]` |
+| Torque scale | `[0.75, 1.00]` |
 | Motor velocity scale | `[0.85, 1.00]` |
 | PD gain scale | `[0.8, 1.2]` |
 | Motor offset | `[-0.02, 0.02]` |
@@ -164,10 +168,11 @@ Safety penalties and termination thresholds share a curriculum factor:
 scale = start + (1 - start) * clamp((step - warmup) / ramp, 0, 1)
 ```
 
-Discovery starts with weak safety pressure (`start = 0.05`), allowing PPO to
-find the manoeuvre first, then ramps to full enforcement over thousands of
-updates. The joint-speed termination ratio tightens from `3.0` (≈90 rad/s) to
-`1.05` (≈31.5 rad/s) so the final policy stays inside the hardware envelope.
+The first 1000 PPO updates retain the original objective (`start = 0`), followed
+by a 3000-update ramp and 1000 updates under the complete safety envelope. The
+joint-speed termination ratio tightens from `1.5` to `1.0`, while permitted
+hard-limit position margin tightens from `0.30 rad` to zero. Non-foot body
+contact becomes terminal once the curriculum reaches full strength.
 
 ---
 
@@ -197,33 +202,26 @@ cd PPO-backflip
 
 # Smoke test: 16 environments, one PPO update
 python train.py --headless --device cuda:0 --num_envs 16 \
-  --trainer rsl_rl --profile safety_initial_repro \
+  --trainer rsl_rl \
   --max_iterations 1 --run_name smoke
 
-# Full from-scratch reproduction of the safety-initial policy
+# Train the fine-tuned Gym-equivalent task from scratch
 python train.py --headless --device cuda:0 --num_envs 4096 \
   --seed 1 --trainer rsl_rl \
-  --profile safety_initial_repro --max_iterations 5000 \
-  --run_name safety_initial_repro
+  --max_iterations 5000 --run_name gym_finetuned
 ```
 
 Checkpoints and TensorBoard logs are written to
 `logs/rsl_rl/go2_backflip/<timestamp>_<run_name>/`.
 
-Available profiles: `gym_discovery`, `lab_discovery`, `safety_initial_repro`
-(default), `safety_targets`, `safety_landing`, `hardware_targets`,
-`hardware_velocity`. The `hardware_*` profiles require `--resume --checkpoint`.
-
 ### Replay and export
 
 ```bash
 python play.py --device cuda:0 --num_envs 1 \
-  --profile safety_initial_repro \
   --checkpoint logs/rsl_rl/go2_backflip/<run>/model_<N>.pt
 
 # Headless replay + ONNX export
 python play.py --headless --device cuda:0 --num_envs 1 --steps 1 --export \
-  --profile safety_initial_repro \
   --checkpoint logs/rsl_rl/go2_backflip/<run>/model_<N>.pt
 ```
 

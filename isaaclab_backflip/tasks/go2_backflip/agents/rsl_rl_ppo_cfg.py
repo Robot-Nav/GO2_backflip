@@ -9,14 +9,14 @@ class Go2BackflipPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     seed = 1
     device = "cuda:0"
     num_steps_per_env = 24
-    max_iterations = 6000
+    max_iterations = 5000
     save_interval = 100
     experiment_name = "go2_backflip"
     run_name = ""
     resume = False
     load_run = ".*"
     load_checkpoint = "model_.*.pt"
-    clip_actions = 100.0
+    clip_actions = 8.0
     # Match the original Gym runner.  The initial standard deviation is 1.0;
     # this lower bound only prevents late training from becoming deterministic.
     min_action_std = 0.35

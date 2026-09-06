@@ -1,6 +1,5 @@
 """Configuration for the phase-conditioned Unitree Go2 backflip task."""
 
-import math
 from pathlib import Path
 
 import isaaclab.sim as sim_utils
@@ -28,39 +27,19 @@ class ControlCfg:
     fixed_action_delay_steps: int | None = None
     fixed_observation_delay_steps: int | None = None
     motor_velocity_x1: float = 13.5
-    motor_velocity_x2: float = 30.0
     motor_torque_y1: float = 20.2
     motor_torque_y2: float = 23.4
-    target_velocity_limit: float = 13.5
-    # Keep the commanded target away from the hard stop.  A 0.02-rad target
-    # margin was not enough to absorb calf inertia during MuJoCo landing.
-    joint_target_limit_margin: float = 0.08
-    # Gym discovery uses the raw actor target directly.  Safety stages enable
-    # the clamp before sending a target to the PD controller.
-    clip_joint_targets: bool = True
-    # During scratch training, introduce the extra target margin only after
-    # the discovery phase. Evaluation and deployment disable this curriculum
-    # and always use the full margin.
-    joint_target_margin_curriculum: bool = True
-    soft_velocity_limit: float = 24.0
-    joint_velocity_limit: float = 30.0
-    # Discovery starts with a reachable guard, then the same curriculum used
-    # by the safety rewards tightens both flip and recovery to the deployable
-    # 31.5-rad/s ceiling. Start at 3.0 (90 rad/s) to allow discovering the flip.
-    velocity_termination_start_ratio: float = 3.0
-    flip_velocity_termination_ratio: float = 1.05
-    velocity_termination_ratio: float = 1.05
-    # Actual joint penetration past the URDF range is a separate failure from
-    # an unsafe actor target.  Tighten the tolerated PhysX penetration with
-    # the same curriculum instead of relying on the simulator hard stop.
-    # This is deliberately looser than the target margin during the discovery
-    # phase.  Even a target that is 0.08 rad inside a hard stop can briefly
-    # overshoot by about 0.10 rad in PhysX during take-off.  Terminating that
-    # first attempted jump prevents PPO from ever observing a full flip.
-    # The curriculum below still converges to the deployable 0.005-rad guard.
-    joint_position_termination_start_excess: float = 0.16
-    joint_position_termination_excess: float = 0.005
-    enable_joint_position_termination: bool = True
+    # Go2HV no-load and deployable PD-target slew speeds, in policy joint order.
+    joint_velocity_limits: tuple[float, ...] = (30.0,) * 12
+    target_velocity_limits: tuple[float, ...] = (13.5,) * 12
+    velocity_termination_start_ratio: float = 1.50
+    velocity_termination_ratio: float = 1.00
+    # Actual position is checked against the hard URDF range. The permitted
+    # overshoot tightens to zero with the safety curriculum.
+    position_termination_start_margin: float = 0.30
+    position_termination_margin: float = 0.0
+    position_validation_tolerance: float = 1.0e-3
+    action_clip: float = 8.0
 
 
 @configclass
@@ -70,10 +49,10 @@ class DomainRandomizationCfg:
     contact_offset_range: tuple[float, float] = (0.0075, 0.0125)
     rest_offset_range: tuple[float, float] = (-0.001, 0.001)
     added_base_mass_range: tuple[float, float] = (-0.5, 1.0)
-    added_base_com_range: tuple[float, float] = (-0.01, 0.01)
+    added_base_com_range: tuple[float, float] = (-0.015, 0.015)
     limb_mass_scale_range: tuple[float, float] = (0.95, 1.05)
     limb_inertia_jitter_range: tuple[float, float] = (0.90, 1.10)
-    torque_scale_range: tuple[float, float] = (0.80, 1.00)
+    torque_scale_range: tuple[float, float] = (0.75, 1.00)
     motor_velocity_scale_range: tuple[float, float] = (0.85, 1.00)
     kp_scale_range: tuple[float, float] = (0.8, 1.2)
     kd_scale_range: tuple[float, float] = (0.8, 1.2)
@@ -104,73 +83,48 @@ class ObservationScaleCfg:
 
 @configclass
 class RewardCfg:
+    soft_dof_pos_limit: float = 0.95
+    soft_dof_vel_limit: float = 0.80
     target_height: float = 0.30
     takeoff_start: float = 0.50
     takeoff_end: float = 0.75
     rotation_end: float = 1.00
     landing_start: float = 1.40
+    recovery_velocity_start: float = 1.00
+    landing_impact_window_steps: int = 6
+    success_hold_time_s: float = 0.20
+    success_max_joint_speed: float = 2.0
+    unsafe_body_contact_force: float = 100.0
+    unsafe_contact_termination_curriculum: float = 1.00
     max_pitch_rate: float = 7.2
     max_upward_velocity: float = 3.0
     phase_duration: float = 2.0
     flip_angle_rate_clip: float = 20.0
-    # Strict Gym reference leaves these effectively disabled.  The
-    # deployment-oriented discovery profile enables them so extra rotations
-    # are not more profitable than a single backflip.
-    rotation_reward_cap: float = 100.0
-    rotation_target_angle: float = 2.0 * math.pi
-    rotation_target_start_time: float = 1.00
-    rotation_target_width: float = 0.25
-    rotation_overrun_start: float = 100.0
-    rotation_overrun_width: float = 0.35
     flip_completion_angle: float = 5.50
     flip_success_angle: float = 5.80
-    flip_success_max_angle: float = 100.0
     recovery_upright_cos: float = 0.90
     recovery_min_height: float = 0.24
     recovery_max_pitch_rate: float = 2.0
     recovery_pose_error: float = 0.30
     recovery_contact_force: float = 5.0
-    # Discovery follows the original Gym task (three feet were sufficient).
-    # Safety fine-tuning raises this to four so a rear-feet-only touchdown
-    # cannot earn the terminal success event.
-    recovery_min_feet_contact_count: int = 3
-    recovery_success_time: float = 2.0
-    # A transient upright frame is not a landing.  Require this many seconds
-    # of consecutive upright/contact/pose checks before awarding success.
-    recovery_hold_time: float = 0.20
-    # Isaac Gym evaluated contact rewards from the final physics sample of a
-    # control interval.  Peak-over-decimation sampling is useful for the
-    # later deployment-safety stage, but changes the original discovery task.
-    use_peak_contact_forces: bool = True
+    takeoff_confirm_steps: int = 2
+    takeoff_min_height: float = 0.25
+    head_contact_success_force: float = 1.0
+    use_peak_contact_forces: bool = False
     body_contact_force: float = 100.0
     max_body_contact_penalty: float = 5.0
     min_head_center_height: float = 0.08
     head_contact_force: float = 40.0
-    # First foot contact happens before the recovery phase in a fast flip.
-    landing_impact_start: float = 1.00
     landing_force_threshold: float = 200.0
-    rear_landing_force_threshold: float = 150.0
     max_landing_impact_penalty: float = 5.0
-    # Event-quality widths.  They do not block discovery: the ordinary
-    # completion/success events remain, while these terms make a safe success
-    # substantially more valuable than an overspeed/hard-impact success.
-    safe_speed_ratio: float = 1.05
-    # These are the widths at which the piecewise-linear quality reaches zero.
-    # Linear quality keeps a useful policy-gradient signal even for the very
-    # unsafe targets encountered during early discovery.
-    safe_speed_width: float = 0.20
-    safe_target_excess_width: float = 1.00
-    safe_position_excess_width: float = 0.05
-    safe_rear_force_width: float = 300.0
-    # A backflip is sparse-event discovery.  Keep the deployment-specific
-    # penalties off until PPO has a chance to find the manoeuvre, then tighten
-    # them smoothly.  With 24 control steps per PPO update, this means 250
-    # discovery updates, a 1250-update transition, then full safety enforcement.
-    safety_curriculum_start: float = 0.05
-    safety_curriculum_warmup_steps: int = 6000
-    safety_curriculum_ramp_steps: int = 30000
+    # 1000 PPO iterations of discovery, a 3000-iteration ramp, then 1000
+    # iterations under the complete safety envelope (24 steps/update).
+    safety_curriculum_start: float = 0.0
+    safety_curriculum_warmup_steps: int = 24000
+    safety_curriculum_ramp_steps: int = 72000
 
     scales: dict[str, float] = {
+        "termination": -1000.0,
         "ang_vel_y": 5.0,
         "ang_vel_z": -1.0,
         "lin_vel_z": 20.0,
@@ -183,34 +137,24 @@ class RewardCfg:
         "feet_distance": -1.0,
         "action_rate": -0.01,
         "action_jerk": -0.02,
-        "dof_vel_limits": -5.0,
+        "dof_vel_limits": -20.0,
         "rotation_progress": 50.0,
-        "rotation_target": 0.0,
-        "rotation_overrun": 0.0,
         "flip_completion": 500.0,
         "flip_success": 500.0,
-        "safe_flip_speed": 300.0,
-        "safe_flip_target": 600.0,
-        "safe_flip_position": 300.0,
-        "safe_flip_landing": 300.0,
         "recovery_upright": 5.0,
         "recovery_height": 3.0,
         "recovery_default_pose": 2.0,
         "recovery_still": 2.0,
         "recovery_feet_contact": 2.0,
-        "recovery_contact_balance": 0.0,
-        "rear_leg_action_rate": -0.05,
+        "rear_leg_action_rate": -0.03,
         "rear_leg_symmetry": -0.5,
-        "recovery_dof_velocity": -1.0,
+        "recovery_dof_velocity": -2.0,
         "head_clearance": -5.0,
         "undesired_body_contact": -10.0,
-        "dof_pos_limits": -5.0,
-        # Moderate continuous shaping preserves takeoff discovery.  The much
-        # larger one-shot safe-target bonus supplies the strong late signal.
-        "joint_target_limits": -0.5,
+        "dof_pos_limits": -20.0,
+        "joint_target_limits": -10.0,
         "head_contact": -20.0,
-        "landing_impact": -3.0,
-        "rear_landing_impact": 0.0,
+        "landing_impact": -10.0,
     }
 
 
@@ -354,7 +298,7 @@ class Go2BackflipEnvCfg(DirectRLEnvCfg):
 
 @configclass
 class Go2BackflipPlayEnvCfg(Go2BackflipEnvCfg):
-    """Nominal deterministic replay of the original Gym discovery task."""
+    """Nominal deterministic replay of the fine-tuned Gym task."""
 
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=1, env_spacing=3.0, replicate_physics=True
@@ -363,28 +307,11 @@ class Go2BackflipPlayEnvCfg(Go2BackflipEnvCfg):
     control: ControlCfg = ControlCfg(
         fixed_action_delay_steps=1,
         fixed_observation_delay_steps=0,
-        joint_target_limit_margin=0.0,
-        joint_target_margin_curriculum=False,
-        # The original Gym task sent the slew-limited raw target straight to
-        # its PD controller.  Clipping it here while replaying a discovery
-        # checkpoint changes the learned torque trajectory substantially.
-        clip_joint_targets=False,
-        soft_velocity_limit=24.0,
-        velocity_termination_start_ratio=3.0,
-        flip_velocity_termination_ratio=1.05,
-        velocity_termination_ratio=1.05,
-        enable_joint_position_termination=False,
     )
     rewards: RewardCfg = RewardCfg(
-        recovery_success_time=1.40,
-        recovery_hold_time=0.0,
-        landing_impact_start=1.40,
-        landing_force_threshold=350.0,
-        rear_landing_force_threshold=350.0,
-        use_peak_contact_forces=False,
-        safety_curriculum_start=0.05,
-        safety_curriculum_warmup_steps=6000,
-        safety_curriculum_ramp_steps=30000,
+        safety_curriculum_start=1.0,
+        safety_curriculum_warmup_steps=0,
+        safety_curriculum_ramp_steps=1,
     )
     domain_rand: DomainRandomizationCfg = DomainRandomizationCfg(
         friction_range=(1.0, 1.0),

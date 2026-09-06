@@ -137,6 +137,18 @@ class Go2BackflipEnv(DirectRLEnv):
 
         self._torque_scales = torch.ones_like(self._actions)
         self._motor_velocity_scales = torch.ones_like(self._actions)
+        self._joint_velocity_limits = torch.tensor(
+            self.cfg.control.joint_velocity_limits, device=self.device
+        ).unsqueeze(0)
+        self._target_velocity_limits = torch.tensor(
+            self.cfg.control.target_velocity_limits, device=self.device
+        ).unsqueeze(0)
+        if self._joint_velocity_limits.shape != (1, num_actions):
+            raise ValueError("joint_velocity_limits must contain one value per action")
+        if self._target_velocity_limits.shape != (1, num_actions):
+            raise ValueError("target_velocity_limits must contain one value per action")
+        if torch.any(self._joint_velocity_limits <= self.cfg.control.motor_velocity_x1):
+            raise ValueError("every joint velocity limit must exceed motor_velocity_x1")
         self._p_gains = torch.full_like(self._actions, self.cfg.control.stiffness)
         self._d_gains = torch.full_like(self._actions, self.cfg.control.damping)
         self._motor_offsets = torch.zeros_like(self._actions)
@@ -155,30 +167,41 @@ class Go2BackflipEnv(DirectRLEnv):
         self._flip_success = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         self._just_completed = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         self._just_succeeded = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
-        self._stable_recovery_steps = torch.zeros(
+        self._was_airborne = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        self._airborne_counter = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        self._head_contact_episode = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        self._landing_detected = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        self._just_landed = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        self._landing_impact_steps_remaining = torch.zeros(
             num_envs, dtype=torch.long, device=self.device
         )
+        self._success_hold_counter = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        self._unsafe_episode = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        self._unsafe_contact = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        self._substep_velocity_violation = torch.zeros(
+            num_envs, dtype=torch.bool, device=self.device
+        )
+        self._substep_position_violation = torch.zeros(
+            num_envs, dtype=torch.bool, device=self.device
+        )
 
-        # Episode diagnostics for distinguishing a true timeout from the
-        # joint-speed guard.  Without these, both appear as an early reset in
+        # Episode diagnostics distinguish timeouts from each safety guard in
         # the RSL-RL console output.
         self._velocity_terminated = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         self._position_terminated = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        self._contact_terminated = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         self._timed_out = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         self._max_joint_speed_ratio = torch.zeros(num_envs, device=self.device)
         self._velocity_termination_threshold = torch.full(
             (num_envs,), self.cfg.control.velocity_termination_start_ratio, device=self.device
         )
         self._velocity_termination_ratio = self.cfg.control.velocity_termination_start_ratio
-        self._position_termination_excess = (
-            self.cfg.control.joint_position_termination_start_excess
-        )
+        self._position_termination_margin = self.cfg.control.position_termination_start_margin
         self._max_landing_foot_force = torch.zeros(num_envs, device=self.device)
         self._max_rear_landing_foot_force = torch.zeros(num_envs, device=self.device)
         self._current_landing_foot_force = torch.zeros(num_envs, device=self.device)
         self._current_rear_landing_foot_force = torch.zeros(num_envs, device=self.device)
         self._max_joint_target_excess = torch.zeros(num_envs, device=self.device)
-        self._max_safe_joint_target_excess = torch.zeros(num_envs, device=self.device)
         self._max_joint_pos_excess = torch.zeros(num_envs, device=self.device)
         self._current_joint_pos_excess = torch.zeros(num_envs, device=self.device)
 
@@ -318,16 +341,21 @@ class Go2BackflipEnv(DirectRLEnv):
         self._contact_offset[:] = contact_offset.to(self.device)
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        self._actions[:] = torch.clamp(actions, -100.0, 100.0)
+        self._actions[:] = torch.clamp(
+            actions, -self.cfg.control.action_clip, self.cfg.control.action_clip
+        )
         self._action_history = torch.roll(self._action_history, shifts=1, dims=0)
         self._action_history[0] = self._actions
 
     def _apply_action(self):
+        # This hook runs before every 5-ms simulation step, so it can latch
+        # peaks which would be invisible at the 50-Hz actor rate.
+        self._record_substep_safety()
         delayed_actions = self._action_history[
             self._action_delay_steps, torch.arange(self.num_envs, device=self.device)
         ]
         max_action_delta = (
-            self.cfg.control.target_velocity_limit
+            self._target_velocity_limits
             * self._motor_velocity_scales
             * self.physics_dt
             / self.cfg.control.action_scale
@@ -348,45 +376,26 @@ class Go2BackflipEnv(DirectRLEnv):
         desired_joint_pos_target = (
             self._slew_limited_actions * self.cfg.control.action_scale + default_pos + self._motor_offsets
         )
-        joint_limits = self._robot.data.joint_pos_limits[:, self._policy_to_sim]
-        margin = self._current_joint_target_margin()
+        joint_limits = self._robot.data.soft_joint_pos_limits[:, self._policy_to_sim]
         raw_target_excess = torch.maximum(
             joint_limits[:, :, 0] - self._raw_joint_pos_target,
             self._raw_joint_pos_target - joint_limits[:, :, 1],
-        ).clamp(min=0.0)
-        # Always record excess relative to the final deployment margin.  The
-        # controller margin may be relaxed during discovery, but the metric
-        # and safe-success bonus must not report that an early clipped target
-        # is deployment-safe.
-        deployment_margin = self.cfg.control.joint_target_limit_margin
-        safe_target_excess = torch.maximum(
-            joint_limits[:, :, 0] + deployment_margin - self._raw_joint_pos_target,
-            self._raw_joint_pos_target - (joint_limits[:, :, 1] - deployment_margin),
         ).clamp(min=0.0)
         self._max_joint_target_excess = torch.maximum(
             self._max_joint_target_excess,
             torch.max(raw_target_excess, dim=1).values,
         )
-        self._max_safe_joint_target_excess = torch.maximum(
-            self._max_safe_joint_target_excess,
-            torch.max(safe_target_excess, dim=1).values,
+        self._joint_pos_target[:] = torch.maximum(
+            torch.minimum(desired_joint_pos_target, joint_limits[:, :, 1]),
+            joint_limits[:, :, 0],
         )
-        if self.cfg.control.clip_joint_targets:
-            self._joint_pos_target[:] = torch.maximum(
-                torch.minimum(desired_joint_pos_target, joint_limits[:, :, 1] - margin),
-                joint_limits[:, :, 0] + margin,
-            )
-        else:
-            # Exact Gym discovery behaviour: the actor's raw PD target is not
-            # pre-clipped; PhysX joint limits provide the only hard stop.
-            self._joint_pos_target[:] = desired_joint_pos_target
         torques = (
             self._p_gains * (self._joint_pos_target - joint_pos)
             - self._d_gains * joint_vel
         )
 
         x1 = self.cfg.control.motor_velocity_x1 * self._motor_velocity_scales
-        x2 = self.cfg.control.motor_velocity_x2 * self._motor_velocity_scales
+        x2 = self._joint_velocity_limits * self._motor_velocity_scales
         speed = torch.abs(joint_vel)
         speed_fraction = torch.where(
             speed < x1,
@@ -401,17 +410,31 @@ class Go2BackflipEnv(DirectRLEnv):
         self._applied_torques[:] = torch.clamp(torques, min=-torque_limit, max=torque_limit)
         self._robot.set_joint_effort_target(self._applied_torques[:, self._sim_to_policy])
 
-    def _current_joint_target_margin(self) -> float:
-        """Target margin used by the controller at the current training step.
+    def _record_substep_safety(self):
+        """Latch hardware-relevant speed and position peaks at 200 Hz."""
+        curriculum = self._safety_curriculum_scale()
+        speed_ratio = self._joint_speed_ratio()
+        self._max_joint_speed_ratio = torch.maximum(self._max_joint_speed_ratio, speed_ratio)
+        velocity_ratio = self.cfg.control.velocity_termination_start_ratio + curriculum * (
+            self.cfg.control.velocity_termination_ratio
+            - self.cfg.control.velocity_termination_start_ratio
+        )
+        self._substep_velocity_violation |= speed_ratio > velocity_ratio
 
-        Scratch training starts without an *extra* target margin, then
-        converges to the deployment margin. Play/deployment use the final
-        margin from their first control step.
-        """
-        margin = self.cfg.control.joint_target_limit_margin
-        if not self.cfg.control.joint_target_margin_curriculum:
-            return margin
-        return margin * self._safety_curriculum_scale()
+        joint_pos = self._robot.data.joint_pos[:, self._policy_to_sim]
+        hard_limits = self._robot.data.joint_pos_limits[:, self._policy_to_sim]
+        below = torch.clamp(hard_limits[:, :, 0] - joint_pos, min=0.0)
+        above = torch.clamp(joint_pos - hard_limits[:, :, 1], min=0.0)
+        position_excess = torch.max(below + above, dim=1).values
+        self._current_joint_pos_excess[:] = position_excess
+        self._max_joint_pos_excess = torch.maximum(
+            self._max_joint_pos_excess, position_excess
+        )
+        position_margin = self.cfg.control.position_termination_start_margin + curriculum * (
+            self.cfg.control.position_termination_margin
+            - self.cfg.control.position_termination_start_margin
+        )
+        self._substep_position_violation |= position_excess > position_margin
 
     def _phase_features(self) -> tuple[torch.Tensor, ...]:
         phase_time = torch.clamp(
@@ -534,16 +557,64 @@ class Go2BackflipEnv(DirectRLEnv):
         return observations
 
     def _update_flip_state(self):
-        speed_ratio = self._joint_speed_ratio()
-        self._max_joint_speed_ratio = torch.maximum(
-            self._max_joint_speed_ratio, speed_ratio
-        )
+        # Include the state after the fourth and final physics substep.
+        self._record_substep_safety()
         foot_forces = self._peak_contact_force(self._feet_contact_ids)
         self._current_landing_foot_force = torch.max(foot_forces, dim=1).values
         self._current_rear_landing_foot_force = torch.max(
             self._peak_contact_force(self._rear_feet_contact_ids), dim=1
         ).values
-        landing_active = self._time() > self.cfg.rewards.landing_impact_start
+        feet_contact = foot_forces > self.cfg.rewards.recovery_contact_force
+        feet_contact_count = torch.sum(feet_contact, dim=1)
+        any_foot_contact = feet_contact_count > 0
+        airborne_now = (self._time() >= self.cfg.rewards.takeoff_start) & (~any_foot_contact)
+        self._airborne_counter = torch.where(
+            airborne_now,
+            self._airborne_counter + 1,
+            torch.zeros_like(self._airborne_counter),
+        )
+        confirmed_takeoff = (
+            (self._airborne_counter >= self.cfg.rewards.takeoff_confirm_steps)
+            & (self._robot.data.root_link_pos_w[:, 2] >= self.cfg.rewards.takeoff_min_height)
+        )
+        self._was_airborne |= confirmed_takeoff
+        self._just_landed = self._was_airborne & (~self._landing_detected) & any_foot_contact
+        self._landing_detected |= self._just_landed
+
+        head_force = torch.max(
+            self._peak_contact_force(self._head_contact_ids), dim=1
+        ).values
+        self._head_contact_episode |= head_force > self.cfg.rewards.head_contact_success_force
+
+        previous_max = self._max_flip_angle.clone()
+        pitch_rate = torch.clamp(
+            -self._robot.data.root_ang_vel_b[:, 1],
+            min=-self.cfg.rewards.flip_angle_rate_clip,
+            max=self.cfg.rewards.flip_angle_rate_clip,
+        )
+        invalid_pre_takeoff = (~self._was_airborne) & (~airborne_now)
+        self._flip_angle[invalid_pre_takeoff] = 0.0
+        self._max_flip_angle[invalid_pre_takeoff] = 0.0
+        rotation_active = airborne_now & (~self._landing_detected) & (~self._head_contact_episode)
+        self._flip_angle += pitch_rate * self.step_dt * rotation_active.float()
+        self._max_flip_angle = torch.maximum(self._max_flip_angle, self._flip_angle)
+        self._rotation_progress_step = torch.clamp(
+            self._max_flip_angle - previous_max, min=0.0
+        )
+        self._just_completed = (
+            (~self._flip_completed)
+            & self._was_airborne
+            & (self._max_flip_angle >= self.cfg.rewards.flip_completion_angle)
+        )
+        self._flip_completed |= self._just_completed
+
+        impact_window = self.cfg.rewards.landing_impact_window_steps
+        self._landing_impact_steps_remaining = torch.where(
+            self._just_landed,
+            torch.full_like(self._landing_impact_steps_remaining, impact_window),
+            torch.clamp(self._landing_impact_steps_remaining - 1, min=0),
+        )
+        landing_active = self._landing_impact_steps_remaining > 0
         self._max_landing_foot_force = torch.maximum(
             self._max_landing_foot_force,
             self._current_landing_foot_force * landing_active,
@@ -552,71 +623,51 @@ class Go2BackflipEnv(DirectRLEnv):
             self._max_rear_landing_foot_force,
             self._current_rear_landing_foot_force * landing_active,
         )
-        joint_pos = self._robot.data.joint_pos[:, self._policy_to_sim]
-        joint_limits = self._robot.data.joint_pos_limits[:, self._policy_to_sim]
-        hard_position_excess = torch.maximum(
-            joint_limits[:, :, 0] - joint_pos,
-            joint_pos - joint_limits[:, :, 1],
-        ).clamp(min=0.0)
-        self._current_joint_pos_excess = torch.max(
-            hard_position_excess, dim=1
-        ).values
-        self._max_joint_pos_excess = torch.maximum(
-            self._max_joint_pos_excess, self._current_joint_pos_excess
-        )
 
-        previous_max = self._max_flip_angle.clone()
-        pitch_rate = torch.clamp(
-            -self._robot.data.root_ang_vel_b[:, 1],
-            min=-self.cfg.rewards.flip_angle_rate_clip,
-            max=self.cfg.rewards.flip_angle_rate_clip,
+        undesired_forces = self._peak_contact_force(self._undesired_contact_sensor_ids)
+        self._unsafe_contact = (
+            torch.max(undesired_forces, dim=1).values
+            > self.cfg.rewards.unsafe_body_contact_force
         )
-        self._flip_angle += pitch_rate * self.step_dt
-        self._max_flip_angle = torch.maximum(self._max_flip_angle, self._flip_angle)
-        # Keep the true maximum for metrics and terminal checks, but stop
-        # paying rotation-progress reward once the requested turn is reached.
-        previous_rewardable_angle = torch.clamp(
-            previous_max, max=self.cfg.rewards.rotation_reward_cap
+        curriculum = self._safety_curriculum_scale()
+        enforce_body_contact = (
+            curriculum >= self.cfg.rewards.unsafe_contact_termination_curriculum
         )
-        rewardable_angle = torch.clamp(
-            self._max_flip_angle, max=self.cfg.rewards.rotation_reward_cap
+        unsafe_now = (
+            (self._unsafe_contact & enforce_body_contact)
+            | self._substep_position_violation
+            | self._substep_velocity_violation
+            | self._head_contact_episode
         )
-        self._rotation_progress_step = torch.clamp(
-            rewardable_angle - previous_rewardable_angle, min=0.0
-        )
-        self._just_completed = (~self._flip_completed) & (
-            self._max_flip_angle >= self.cfg.rewards.flip_completion_angle
-        )
-        self._flip_completed |= self._just_completed
+        self._unsafe_episode |= unsafe_now
+        self._flip_success &= ~unsafe_now
 
-        feet_contact_count = torch.sum(
-            foot_forces > self.cfg.rewards.recovery_contact_force, dim=1
-        )
         pose_error = torch.max(
             torch.abs(self._robot.data.joint_pos - self._robot.data.default_joint_pos), dim=1
         ).values
-        stable_now = (
+        max_joint_speed = torch.max(torch.abs(self._robot.data.joint_vel), dim=1).values
+        success_candidate = (
             self._flip_completed
             & (self._max_flip_angle >= self.cfg.rewards.flip_success_angle)
-            & (self._max_flip_angle <= self.cfg.rewards.flip_success_max_angle)
-            & (self._time() >= self.cfg.rewards.recovery_success_time)
+            & self._landing_detected
+            & (self._time() >= self.cfg.rewards.landing_start)
             & (-self._robot.data.projected_gravity_b[:, 2] >= self.cfg.rewards.recovery_upright_cos)
             & (self._robot.data.root_link_pos_w[:, 2] >= self.cfg.rewards.recovery_min_height)
             & (torch.abs(self._robot.data.root_ang_vel_b[:, 1]) <= self.cfg.rewards.recovery_max_pitch_rate)
+            & (max_joint_speed <= self.cfg.rewards.success_max_joint_speed)
             & (pose_error <= self.cfg.rewards.recovery_pose_error)
-            & (feet_contact_count >= self.cfg.rewards.recovery_min_feet_contact_count)
+            & (feet_contact_count >= 3)
+            & (~self._unsafe_episode)
         )
-        self._stable_recovery_steps = torch.where(
-            stable_now,
-            self._stable_recovery_steps + 1,
-            torch.zeros_like(self._stable_recovery_steps),
+        self._success_hold_counter = torch.where(
+            success_candidate,
+            self._success_hold_counter + 1,
+            torch.zeros_like(self._success_hold_counter),
         )
-        required_stable_steps = max(
-            1, int(round(self.cfg.rewards.recovery_hold_time / self.step_dt))
+        required_hold_steps = max(
+            1, int(round(self.cfg.rewards.success_hold_time_s / self.step_dt))
         )
-        success_now = stable_now & (
-            self._stable_recovery_steps >= required_stable_steps
-        )
+        success_now = self._success_hold_counter >= required_hold_steps
         self._just_succeeded = (~self._flip_success) & success_now
         self._flip_success |= self._just_succeeded
 
@@ -624,96 +675,38 @@ class Go2BackflipEnv(DirectRLEnv):
         return torch.max(
             torch.abs(self._robot.data.joint_vel[:, self._policy_to_sim])
             / torch.clamp(
-                self.cfg.control.joint_velocity_limit * self._motor_velocity_scales,
+                self._joint_velocity_limits * self._motor_velocity_scales,
                 min=1.0,
             ),
             dim=1,
         ).values
 
-    def _safe_speed_quality(self) -> torch.Tensor:
-        excess = torch.clamp(
-            self._max_joint_speed_ratio - self.cfg.rewards.safe_speed_ratio,
-            min=0.0,
-        )
-        return torch.clamp(
-            1.0 - excess / self.cfg.rewards.safe_speed_width, min=0.0, max=1.0
-        )
-
-    def _safe_target_quality(self) -> torch.Tensor:
-        return torch.clamp(
-            1.0
-            - self._max_safe_joint_target_excess
-            / self.cfg.rewards.safe_target_excess_width,
-            min=0.0,
-            max=1.0,
-        )
-
-    def _safe_position_quality(self) -> torch.Tensor:
-        return torch.clamp(
-            1.0
-            - self._max_joint_pos_excess
-            / self.cfg.rewards.safe_position_excess_width,
-            min=0.0,
-            max=1.0,
-        )
-
-    def _safe_landing_quality(self) -> torch.Tensor:
-        excess = torch.clamp(
-            (
-                self._max_rear_landing_foot_force
-                - self.cfg.rewards.rear_landing_force_threshold
-            )
-            / self.cfg.rewards.safe_rear_force_width,
-            min=0.0,
-        )
-        # ``excess`` has already been normalized by ``safe_rear_force_width``.
-        # Dividing by the width a second time made even very hard landings
-        # receive almost the full safe-landing bonus.
-        return torch.clamp(1.0 - excess, min=0.0, max=1.0)
-
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._update_flip_state()
-        speed_ratio = self._joint_speed_ratio()
         curriculum = self._safety_curriculum_scale()
-        start_scale = self.cfg.rewards.safety_curriculum_start
-        normalized_curriculum = min(max((curriculum - start_scale) / (1.0 - start_scale), 0.0), 1.0)
         start_ratio = self.cfg.control.velocity_termination_start_ratio
         end_ratio = self.cfg.control.velocity_termination_ratio
-        self._velocity_termination_ratio = start_ratio + (end_ratio - start_ratio) * normalized_curriculum
-        position_start = self.cfg.control.joint_position_termination_start_excess
-        position_end = self.cfg.control.joint_position_termination_excess
-        self._position_termination_excess = position_start + (
+        self._velocity_termination_ratio = start_ratio + (end_ratio - start_ratio) * curriculum
+        position_start = self.cfg.control.position_termination_start_margin
+        position_end = self.cfg.control.position_termination_margin
+        self._position_termination_margin = position_start + (
             position_end - position_start
-        ) * normalized_curriculum
-
-        # The common curriculum threshold starts loose enough for discovery.
-        # The phase-specific floor only prevents a stricter recovery override;
-        # both converge to the same deployable ratio in the default profile.
-        termination_threshold = torch.full_like(speed_ratio, self._velocity_termination_ratio)
-        flip_phase = self._time() < self.cfg.rewards.landing_start
-        flip_threshold = torch.full_like(
-            speed_ratio, self.cfg.control.flip_velocity_termination_ratio
+        ) * curriculum
+        self._velocity_termination_threshold[:] = self._velocity_termination_ratio
+        velocity_terminated = self._substep_velocity_violation.clone()
+        position_terminated = self._substep_position_violation.clone()
+        enforce_body_contact = (
+            curriculum >= self.cfg.rewards.unsafe_contact_termination_curriculum
         )
-        termination_threshold = torch.where(
-            flip_phase,
-            torch.maximum(termination_threshold, flip_threshold),
-            termination_threshold,
-        )
-        self._velocity_termination_threshold[:] = termination_threshold
-        velocity_terminated = speed_ratio > termination_threshold
-        if self.cfg.control.enable_joint_position_termination:
-            position_terminated = (
-                self._current_joint_pos_excess > self._position_termination_excess
-            )
-        else:
-            position_terminated = torch.zeros_like(velocity_terminated)
-        terminated = velocity_terminated | position_terminated
+        contact_terminated = self._unsafe_contact & enforce_body_contact
+        terminated = velocity_terminated | position_terminated | contact_terminated
         # Match the original Gym task: it increments the control-step counter
         # before checking ``> max_episode_length``.  This preserves its final
         # 20-ms recovery sample instead of ending one policy step earlier.
         time_out = self.episode_length_buf > self.max_episode_length
         self._velocity_terminated[:] = velocity_terminated
         self._position_terminated[:] = position_terminated
+        self._contact_terminated[:] = contact_terminated
         self._timed_out[:] = time_out
         return terminated, time_out
 
@@ -732,24 +725,21 @@ class Go2BackflipEnv(DirectRLEnv):
 
         finished_angle = self._max_flip_angle[env_ids].clone()
         finished_success = self._flip_success[env_ids].float().clone()
+        finished_unsafe = self._unsafe_episode[env_ids].float().clone()
+        finished_airborne = self._was_airborne[env_ids].float().clone()
+        finished_head_contact = self._head_contact_episode[env_ids].float().clone()
         finished_velocity_terminated = self._velocity_terminated[env_ids].float().clone()
         finished_position_terminated = self._position_terminated[env_ids].float().clone()
+        finished_contact_terminated = self._contact_terminated[env_ids].float().clone()
         finished_timed_out = self._timed_out[env_ids].float().clone()
         finished_max_speed_ratio = self._max_joint_speed_ratio[env_ids].clone()
         finished_max_landing_force = self._max_landing_foot_force[env_ids].clone()
         finished_max_rear_landing_force = self._max_rear_landing_foot_force[env_ids].clone()
         finished_max_joint_target_excess = self._max_joint_target_excess[env_ids].clone()
-        finished_max_safe_joint_target_excess = self._max_safe_joint_target_excess[
-            env_ids
-        ].clone()
         finished_max_joint_pos_excess = self._max_joint_pos_excess[env_ids].clone()
         finished_recovery_hold_time = (
-            self._stable_recovery_steps[env_ids].float().clone() * self.step_dt
+            self._success_hold_counter[env_ids].float().clone() * self.step_dt
         )
-        finished_speed_quality = self._safe_speed_quality()[env_ids].clone()
-        finished_target_quality = self._safe_target_quality()[env_ids].clone()
-        finished_position_quality = self._safe_position_quality()[env_ids].clone()
-        finished_landing_quality = self._safe_landing_quality()[env_ids].clone()
         super()._reset_idx(env_ids)
 
         self.extras["log"] = {}
@@ -759,6 +749,11 @@ class Go2BackflipEnv(DirectRLEnv):
                 episodic_sum[env_ids] = 0.0
             self.extras["log"]["Episode_Metric/flip_angle_rad"] = torch.mean(finished_angle)
             self.extras["log"]["Episode_Metric/flip_success"] = torch.mean(finished_success)
+            self.extras["log"]["Episode_Metric/unsafe_episode"] = torch.mean(finished_unsafe)
+            self.extras["log"]["Episode_Metric/airborne_episode"] = torch.mean(finished_airborne)
+            self.extras["log"]["Episode_Metric/head_contact_episode"] = torch.mean(
+                finished_head_contact
+            )
             self.extras["log"]["Episode_Metric/max_joint_speed_ratio"] = torch.mean(
                 finished_max_speed_ratio
             )
@@ -771,32 +766,20 @@ class Go2BackflipEnv(DirectRLEnv):
             self.extras["log"]["Episode_Metric/max_joint_target_excess_rad"] = torch.mean(
                 finished_max_joint_target_excess
             )
-            self.extras["log"]["Episode_Metric/max_safe_joint_target_excess_rad"] = torch.mean(
-                finished_max_safe_joint_target_excess
-            )
             self.extras["log"]["Episode_Metric/max_joint_pos_excess_rad"] = torch.mean(
                 finished_max_joint_pos_excess
             )
             self.extras["log"]["Episode_Metric/recovery_hold_time_s"] = torch.mean(
                 finished_recovery_hold_time
             )
-            self.extras["log"]["Episode_Metric/safe_speed_quality"] = torch.mean(
-                finished_speed_quality
-            )
-            self.extras["log"]["Episode_Metric/safe_target_quality"] = torch.mean(
-                finished_target_quality
-            )
-            self.extras["log"]["Episode_Metric/safe_position_quality"] = torch.mean(
-                finished_position_quality
-            )
-            self.extras["log"]["Episode_Metric/safe_landing_quality"] = torch.mean(
-                finished_landing_quality
-            )
             self.extras["log"]["Episode_Termination/joint_velocity_rate"] = torch.mean(
                 finished_velocity_terminated
             )
             self.extras["log"]["Episode_Termination/joint_position_rate"] = torch.mean(
                 finished_position_terminated
+            )
+            self.extras["log"]["Episode_Termination/body_contact_rate"] = torch.mean(
+                finished_contact_terminated
             )
             self.extras["log"]["Episode_Termination/timeout_rate"] = torch.mean(
                 finished_timed_out
@@ -805,11 +788,8 @@ class Go2BackflipEnv(DirectRLEnv):
             self.extras["log"]["Episode_Curriculum/velocity_termination_ratio"] = (
                 self._velocity_termination_ratio
             )
-            self.extras["log"]["Episode_Curriculum/position_termination_excess_rad"] = (
-                self._position_termination_excess
-            )
-            self.extras["log"]["Episode_Curriculum/flip_velocity_termination_ratio"] = (
-                self.cfg.control.flip_velocity_termination_ratio
+            self.extras["log"]["Episode_Curriculum/position_termination_margin_rad"] = (
+                self._position_termination_margin
             )
 
         default_root_state = self._robot.data.default_root_state[env_ids].clone()
@@ -884,9 +864,20 @@ class Go2BackflipEnv(DirectRLEnv):
         self._flip_success[env_ids] = False
         self._just_completed[env_ids] = False
         self._just_succeeded[env_ids] = False
-        self._stable_recovery_steps[env_ids] = 0
+        self._was_airborne[env_ids] = False
+        self._airborne_counter[env_ids] = 0
+        self._head_contact_episode[env_ids] = False
+        self._landing_detected[env_ids] = False
+        self._just_landed[env_ids] = False
+        self._landing_impact_steps_remaining[env_ids] = 0
+        self._success_hold_counter[env_ids] = 0
+        self._unsafe_episode[env_ids] = False
+        self._unsafe_contact[env_ids] = False
+        self._substep_velocity_violation[env_ids] = False
+        self._substep_position_violation[env_ids] = False
         self._velocity_terminated[env_ids] = False
         self._position_terminated[env_ids] = False
+        self._contact_terminated[env_ids] = False
         self._timed_out[env_ids] = False
         self._max_joint_speed_ratio[env_ids] = 0.0
         self._max_landing_foot_force[env_ids] = 0.0
@@ -894,7 +885,6 @@ class Go2BackflipEnv(DirectRLEnv):
         self._current_landing_foot_force[env_ids] = 0.0
         self._current_rear_landing_foot_force[env_ids] = 0.0
         self._max_joint_target_excess[env_ids] = 0.0
-        self._max_safe_joint_target_excess[env_ids] = 0.0
         self._max_joint_pos_excess[env_ids] = 0.0
         self._current_joint_pos_excess[env_ids] = 0.0
         self._velocity_termination_threshold[env_ids] = (
@@ -910,6 +900,14 @@ class Go2BackflipEnv(DirectRLEnv):
         progress = min(max((self.common_step_counter - warmup) / ramp, 0.0), 1.0)
         start = self.cfg.rewards.safety_curriculum_start
         return start + (1.0 - start) * progress
+
+    def _reward_termination(self):
+        terminated = (
+            self._velocity_terminated
+            | self._position_terminated
+            | self._contact_terminated
+        )
+        return (terminated & (~self._timed_out)).float()
 
     def _reward_ang_vel_y(self):
         value = torch.clamp(
@@ -951,14 +949,12 @@ class Go2BackflipEnv(DirectRLEnv):
 
     def _reward_height_control(self):
         value = torch.square(self.cfg.rewards.target_height - self._robot.data.root_link_pos_w[:, 2])
-        active = (self._time() < 0.4) | (self._time() > self.cfg.rewards.landing_start)
+        active = (self._time() < 0.4) | self._landing_detected
         return value * active
 
     def _reward_default_pose(self):
         error = torch.square(self._robot.data.joint_pos - self._robot.data.default_joint_pos).sum(dim=1)
-        active = (self._time() < self.cfg.rewards.takeoff_start) | (
-            self._time() > self.cfg.rewards.landing_start
-        )
+        active = (self._time() < self.cfg.rewards.takeoff_start) | self._landing_detected
         return error * active
 
     def _reward_head_clearance(self):
@@ -979,7 +975,7 @@ class Go2BackflipEnv(DirectRLEnv):
 
     def _reward_landing_impact(self):
         peak_force = self._current_landing_foot_force
-        active = self._time() > self.cfg.rewards.landing_impact_start
+        active = self._landing_impact_steps_remaining > 0
         excess = torch.clamp(
             (peak_force - self.cfg.rewards.landing_force_threshold)
             / self.cfg.rewards.landing_force_threshold,
@@ -990,20 +986,6 @@ class Go2BackflipEnv(DirectRLEnv):
             self._safety_curriculum_scale()
             * torch.square(excess)
             * active
-        )
-
-    def _reward_rear_landing_impact(self):
-        rear_peak_force = self._current_rear_landing_foot_force
-        excess = torch.clamp(
-            (rear_peak_force - self.cfg.rewards.rear_landing_force_threshold)
-            / self.cfg.rewards.rear_landing_force_threshold,
-            min=0.0,
-            max=self.cfg.rewards.max_landing_impact_penalty,
-        )
-        return (
-            self._safety_curriculum_scale()
-            * torch.square(excess)
-            * (self._time() > self.cfg.rewards.landing_impact_start)
         )
 
     def _reward_actions_symmetry(self):
@@ -1040,7 +1022,11 @@ class Go2BackflipEnv(DirectRLEnv):
         return self._safety_curriculum_scale() * torch.square(second_difference).sum(dim=1)
 
     def _reward_dof_vel_limits(self):
-        effective_limit = self.cfg.control.soft_velocity_limit * self._motor_velocity_scales
+        effective_limit = (
+            self._joint_velocity_limits
+            * self.cfg.rewards.soft_dof_vel_limit
+            * self._motor_velocity_scales
+        )
         relative_excess = torch.clamp(
             torch.abs(self._robot.data.joint_vel[:, self._policy_to_sim]) / effective_limit - 1.0,
             min=0.0,
@@ -1051,47 +1037,14 @@ class Go2BackflipEnv(DirectRLEnv):
     def _reward_rotation_progress(self):
         return self._rotation_progress_step
 
-    def _reward_rotation_target(self):
-        """Late-phase preference for one turn instead of an over-rotation."""
-        active = (
-            self._flip_completed
-            & (self._time() >= self.cfg.rewards.rotation_target_start_time)
-        )
-        error = self._max_flip_angle - self.cfg.rewards.rotation_target_angle
-        return torch.exp(-torch.square(error / self.cfg.rewards.rotation_target_width)) * active
-
-    def _reward_rotation_overrun(self):
-        """Penalty for motion beyond the acceptable post-flip angle window."""
-        active = self._time() >= self.cfg.rewards.rotation_target_start_time
-        excess = torch.clamp(
-            self._max_flip_angle - self.cfg.rewards.rotation_overrun_start, min=0.0
-        )
-        return torch.square(excess / self.cfg.rewards.rotation_overrun_width) * active
-
     def _reward_flip_completion(self):
         return self._just_completed.float()
 
     def _reward_flip_success(self):
         return self._just_succeeded.float()
 
-    def _reward_safe_flip_speed(self):
-        """One-shot bonus for completing without a ballistic joint-speed peak."""
-        return self._just_succeeded.float() * self._safe_speed_quality()
-
-    def _reward_safe_flip_target(self):
-        """One-shot bonus for an actor trajectory that does not rely on clipping."""
-        return self._just_succeeded.float() * self._safe_target_quality()
-
-    def _reward_safe_flip_position(self):
-        """One-shot bonus for keeping actual joints inside the URDF range."""
-        return self._just_succeeded.float() * self._safe_position_quality()
-
-    def _reward_safe_flip_landing(self):
-        """One-shot bonus for a low-impact rear-foot landing."""
-        return self._just_succeeded.float() * self._safe_landing_quality()
-
     def _recovery_active(self):
-        return self._flip_completed & (self._time() >= self.cfg.rewards.landing_start)
+        return self._flip_completed & self._landing_detected
 
     def _reward_recovery_upright(self):
         upright_error = torch.square(self._robot.data.projected_gravity_b[:, :2]).sum(dim=1)
@@ -1125,25 +1078,6 @@ class Go2BackflipEnv(DirectRLEnv):
         )
         return contact_fraction * self._recovery_active()
 
-    def _reward_recovery_contact_balance(self):
-        """Reward support from both axle pairs during the recovery window.
-
-        A rear-first touchdown is physically normal, but the discovery task
-        previously allowed it to finish as a successful landing before the
-        front feet reached the floor.  The minimum of front/rear contact
-        fractions is one only when both pairs support the robot.
-        """
-        threshold = self.cfg.rewards.recovery_contact_force
-        front_fraction = torch.mean(
-            (self._peak_contact_force(self._front_feet_contact_ids) > threshold).float(),
-            dim=1,
-        )
-        rear_fraction = torch.mean(
-            (self._peak_contact_force(self._rear_feet_contact_ids) > threshold).float(),
-            dim=1,
-        )
-        return torch.minimum(front_fraction, rear_fraction) * self._recovery_active()
-
     def _reward_rear_leg_action_rate(self):
         delta = (
             self._actions[:, self._rear_policy_joint_ids]
@@ -1171,7 +1105,7 @@ class Go2BackflipEnv(DirectRLEnv):
         return (
             self._safety_curriculum_scale()
             * torch.square(normalized).sum(dim=1)
-            * (self._time() > self.cfg.rewards.landing_start)
+            * (self._time() >= self.cfg.rewards.recovery_velocity_start)
         )
 
     def _reward_undesired_body_contact(self):
@@ -1190,12 +1124,11 @@ class Go2BackflipEnv(DirectRLEnv):
         return self._safety_curriculum_scale() * (below + above).sum(dim=1)
 
     def _reward_joint_target_limits(self):
-        limits = self._robot.data.joint_pos_limits[:, self._policy_to_sim]
-        margin = self._current_joint_target_margin()
+        limits = self._robot.data.soft_joint_pos_limits[:, self._policy_to_sim]
         below = torch.clamp(
-            limits[:, :, 0] + margin - self._raw_joint_pos_target, min=0.0
+            limits[:, :, 0] - self._raw_joint_pos_target, min=0.0
         )
         above = torch.clamp(
-            self._raw_joint_pos_target - (limits[:, :, 1] - margin), min=0.0
+            self._raw_joint_pos_target - limits[:, :, 1], min=0.0
         )
         return self._safety_curriculum_scale() * torch.square(below + above).sum(dim=1)

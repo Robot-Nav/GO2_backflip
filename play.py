@@ -17,20 +17,6 @@ parser.add_argument("--steps", type=int, default=-1, help="Exit after this many 
 parser.add_argument("--real_time", action="store_true", help="Sleep to match the 50 Hz policy rate.")
 parser.add_argument("--randomized", action="store_true", help="Use training randomization and sensor noise.")
 parser.add_argument("--export", action="store_true", help="Export policy.pt and policy.onnx beside the checkpoint.")
-parser.add_argument(
-    "--profile",
-    choices=(
-        "gym_discovery",
-        "lab_discovery",
-        "safety_targets",
-        "safety_landing",
-        "safety_initial_repro",
-        "hardware_targets",
-        "hardware_velocity",
-    ),
-    default="safety_initial_repro",
-    help="Controller/recovery settings used when replaying the checkpoint.",
-)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
@@ -57,84 +43,6 @@ from isaaclab_backflip.tasks.go2_backflip.go2_backflip_env_cfg import (
 TASK_ID = "Isaac-Go2-Backflip-Direct-v0"
 
 
-def configure_play_profile(env_cfg):
-    """Apply the deterministic deployment settings for a training stage."""
-    # Both discovery profiles use the original Gym raw PD target.
-    if args.profile in ("gym_discovery", "lab_discovery"):
-        return
-
-    control = env_cfg.control
-    reward = env_cfg.rewards
-
-    if args.profile == "safety_initial_repro":
-        # Match the saved safety-initial environment at full curriculum.  The
-        # training profile itself remains a raw-target policy.
-        env_cfg.scene.env_spacing = 2.5
-        env_cfg.terrain.env_spacing = 2.5
-        control.clip_joint_targets = False
-        control.joint_target_limit_margin = 0.0
-        control.joint_target_margin_curriculum = False
-        control.enable_joint_position_termination = False
-        control.soft_velocity_limit = 24.0
-        control.velocity_termination_start_ratio = 1.25
-        control.flip_velocity_termination_ratio = 1.5
-        control.velocity_termination_ratio = 1.25
-        reward.recovery_success_time = 1.40
-        reward.recovery_hold_time = 0.0
-        reward.recovery_min_feet_contact_count = 3
-        reward.use_peak_contact_forces = False
-        return
-
-    control.clip_joint_targets = True
-    control.joint_target_limit_margin = 0.08
-    control.joint_target_margin_curriculum = False
-    control.enable_joint_position_termination = True
-    reward.recovery_success_time = 2.0
-
-    if args.profile == "safety_targets":
-        control.joint_position_termination_start_excess = 0.16
-        control.joint_position_termination_excess = 0.02
-        control.velocity_termination_start_ratio = 3.0
-        control.flip_velocity_termination_ratio = 3.0
-        control.velocity_termination_ratio = 3.0
-        return
-    if args.profile == "hardware_targets":
-        control.joint_position_termination_start_excess = 0.01
-        control.joint_position_termination_excess = 0.01
-        control.velocity_termination_start_ratio = 1.25
-        control.flip_velocity_termination_ratio = 1.5
-        control.velocity_termination_ratio = 1.25
-        reward.recovery_success_time = 1.40
-        reward.recovery_hold_time = 0.0
-        reward.recovery_min_feet_contact_count = 3
-        reward.use_peak_contact_forces = False
-        return
-
-    control.joint_position_termination_start_excess = 0.04
-    control.joint_position_termination_excess = 0.005
-    control.soft_velocity_limit = 20.0
-    control.velocity_termination_start_ratio = 1.50
-    control.flip_velocity_termination_ratio = 1.05
-    control.velocity_termination_ratio = 1.05
-    reward.landing_impact_start = 1.00
-    reward.landing_force_threshold = 200.0
-    reward.rear_landing_force_threshold = 150.0
-
-    if args.profile == "hardware_velocity":
-        control.joint_position_termination_start_excess = 0.005
-        control.soft_velocity_limit = 20.0
-        control.velocity_termination_start_ratio = 1.0
-        control.flip_velocity_termination_ratio = 1.0
-        control.velocity_termination_ratio = 1.0
-        reward.landing_impact_start = 1.40
-        reward.landing_force_threshold = 350.0
-        reward.rear_landing_force_threshold = 350.0
-        reward.recovery_success_time = 1.40
-        reward.recovery_hold_time = 0.0
-        reward.recovery_min_feet_contact_count = 3
-        reward.use_peak_contact_forces = False
-
-
 def main():
     if not args.checkpoint:
         raise ValueError("--checkpoint=/path/to/model.pt is required")
@@ -143,7 +51,12 @@ def main():
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
 
     env_cfg = Go2BackflipEnvCfg() if args.randomized else Go2BackflipPlayEnvCfg()
-    configure_play_profile(env_cfg)
+    if args.randomized:
+        # Replay a randomized policy under the final safety envelope rather
+        # than silently restarting the training curriculum at zero.
+        env_cfg.rewards.safety_curriculum_start = 1.0
+        env_cfg.rewards.safety_curriculum_warmup_steps = 0
+        env_cfg.rewards.safety_curriculum_ramp_steps = 1
     agent_cfg = Go2BackflipPPORunnerCfg()
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.seed = args.seed
