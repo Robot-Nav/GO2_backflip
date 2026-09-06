@@ -3,7 +3,6 @@
 Phase-conditioned backflip control for the Unitree Go2 quadruped, trained with
 asymmetric Proximal Policy Optimization (PPO) and deployed to the real robot.
 
-中文：[👉 README_CN](https://github.com/Robot-Nav/GO2_backflip/blob/PPO-backflip/README_CN.md)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)]()
