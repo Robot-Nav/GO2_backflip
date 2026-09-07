@@ -30,6 +30,8 @@ from rl.Backflip import BackflipRunner
 
 
 def train_dog(args):
+    if getattr(args, "init_actor", None):
+        raise ValueError("--init_actor is currently supported only for --task=go2_backflip")
     if args.algo.lower() not in {"ppo", "backflip"}:
         raise ValueError("The dog task supports --algo=PPO only.")
 
