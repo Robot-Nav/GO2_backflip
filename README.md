@@ -15,7 +15,20 @@ asymmetric Proximal Policy Optimization (PPO) and deployed to the real robot.
 ---
 
 
-中文：[👉 README_CN ](https://github.com/Robot-Nav/GO2_backflip/blob/PPO-backflip/README_CN.md)
+**中文**：[👉 README_CN ](https://github.com/Robot-Nav/GO2_backflip/blob/PPO-backflip/README_CN.md)
+
+**Getting Started Guide**：[👉 Getting Started Guide ](https://github.com/Robot-Nav/GO2_backflip/blob/PPO-backflip/%E8%BF%90%E8%A1%8C%E6%8C%87%E5%8D%97.md)
+
+
+---
+
+真机演示：
+
+
+https://github.com/user-attachments/assets/d54488e1-97bc-4082-8ada-9ad9b79c1633
+
+
+
 
 ---
 ## Overview
