@@ -13,6 +13,18 @@
 
 ---
 
+**运行指南**：[👉 运行指南 ](https://github.com/Robot-Nav/GO2_backflip/blob/PPO-backflip/%E8%BF%90%E8%A1%8C%E6%8C%87%E5%8D%97.md)
+
+
+---
+
+真机演示：
+
+
+https://github.com/user-attachments/assets/d54488e1-97bc-4082-8ada-9ad9b79c1633
+
+---
+
 ## 项目简介
 
 本仓库训练一个 12 自由度的宇树 Go2，使其完成一次后空翻并恢复稳定站立。任务被
