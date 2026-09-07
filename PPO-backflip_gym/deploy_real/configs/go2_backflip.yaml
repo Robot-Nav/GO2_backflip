@@ -1,0 +1,85 @@
+# Go2 60-dimensional backflip policy: real-robot deployment parameters.
+# All vectors are in policy order: FL, FR, RL, RR; hip, thigh, calf per leg.
+
+lowcmd_topic: "rt/lowcmd"
+lowstate_topic: "rt/lowstate"
+
+# One-shot hardware candidate selected by the operator.  Passing nominal
+# MuJoCo is necessary but does not by itself certify hardware safety.
+actor_path: "outputs/go2_backflip_original_safe_v1/model_6000_actor.onnx"
+
+# policy[i] -> Unitree Go2 motor index
+# SDK motor order: FR(0..2), FL(3..5), RR(6..8), RL(9..11)
+leg_joint2motor_idx: [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]
+
+default_angles: [0.0, 0.8, -1.5, 0.0, 0.8, -1.5, 0.0, 1.0, -1.5, 0.0, 1.0, -1.5]
+joint_lower_limits: [-1.0472, -1.5708, -2.7227, -1.0472, -1.5708, -2.7227, -1.0472, -0.5236, -2.7227, -1.0472, -0.5236, -2.7227]
+joint_upper_limits: [1.0472, 3.4907, -0.83776, 1.0472, 3.4907, -0.83776, 1.0472, 4.5379, -0.83776, 1.0472, 4.5379, -0.83776]
+soft_position_limit: 0.95
+kps: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0]
+kds: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+num_actions: 12
+num_obs: 60
+ang_vel_scale: 0.25
+dof_pos_scale: 1.0
+dof_vel_scale: 0.05
+action_scale: 0.5
+target_velocity_limits: [13.5, 13.5, 13.5, 13.5, 13.5, 13.5, 13.5, 13.5, 13.5, 13.5, 13.5, 13.5]
+clip_actions: 8.0
+control_dt: 0.02
+# Actor remains at 50 Hz; the latest motor command is republished at 500 Hz.
+lowcmd_dt: 0.002
+phase_duration: 2.0
+action_latency_steps: 1
+diagnostic_interval_steps: 5
+diagnostic_duration_s: 5.0
+
+# Official Go2HV torque-speed curve, applied by the 500-Hz deployment layer.
+torque_limit_enabled: true
+motor_velocity_x1: 13.5
+torque_limits: [20.2, 20.2, 20.2, 20.2, 20.2, 20.2, 20.2, 20.2, 20.2, 20.2, 20.2, 20.2]
+brake_torque_limits: [23.4, 23.4, 23.4, 23.4, 23.4, 23.4, 23.4, 23.4, 23.4, 23.4, 23.4, 23.4]
+motor_velocity_limits: [30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0]
+
+# Startup: hold current pose, slowly move to the trained default pose, then stand.
+# Give a deeply crouched robot enough time to traverse the full range before
+# applying the per-joint loaded-stance handoff limits below.
+startup_hold_s: 1.0
+startup_ramp_s: 8.0
+startup_stand_s: 3.0
+# Position-PD needs static error to generate gravity-support torque. These are
+# handoff limits (hip/thigh/calf per leg), not backflip-trigger limits.
+startup_joint_error_limits: [0.12, 0.12, 0.35, 0.12, 0.12, 0.35, 0.12, 0.12, 0.35, 0.12, 0.12, 0.35]
+blend_in_s: 1.0
+weak_motor: []
+damping_kd: 8.0
+
+# Runtime safety. Triggering a new flip still requires an upright robot.
+state_timeout_s: 0.10
+trigger_max_tilt_rad: 0.10
+trigger_max_joint_speed: 0.50
+# Terminal-phase loaded stance measured repeatedly in the hardware-only
+# wait test on this Go2 EDU.  It is intentionally separate from both the
+# zero-action PD targets and the MuJoCo equilibrium pose.
+trigger_joint_reference: [0.023, 0.827, -1.591, -0.019, 0.841, -1.595, 0.079, 0.902, -1.669, -0.102, 0.904, -1.675]
+trigger_joint_reference_tolerances: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10]
+trigger_stable_hold_s: 1.00
+single_flip_only: true
+velocity_safety_ratio: 1.0
+joint_position_tolerance: 0.02
+max_abs_action: 8.0
+max_consecutive_late_steps: 5
+min_battery_voltage: 24.0
+# Ignore a single-sample takeoff voltage sag. Stop only when voltage remains
+# below the threshold continuously for this duration.
+low_voltage_hold_s: 0.25
+
+max_motor_lost_increment: 10
+max_zero_temperature_motors: 3
+
+# A new A-button trigger is accepted only while upright, nearly stationary and
+# standing on the feet. Foot force uses a standing baseline measured at startup.
+require_foot_contact: true
+foot_contact_fraction: 0.80
+foot_baseline_min: 20.0
